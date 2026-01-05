@@ -1,37 +1,77 @@
+import json
+import logging
 import os
 from pathlib import Path
 from typing import List
 
 from jinja2 import Environment, FileSystemLoader
 
-from benchmarks.swebench.build_images import (
-    extract_custom_tag,
-    get_official_docker_image,
-)
 from benchmarks.utils.args_parser import get_parser
-from benchmarks.utils.build_utils import build_image
-from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
 from benchmarks.utils.critics import create_critic
-from benchmarks.utils.dataset import get_dataset
 from benchmarks.utils.evaluation import Evaluation
 from benchmarks.utils.evaluation_utils import (
     construct_eval_output_dir,
     get_default_on_result_writer,
 )
-from benchmarks.utils.image_utils import image_exists
 from benchmarks.utils.models import (
     EvalInstance,
     EvalMetadata,
     EvalOutput,
 )
-from benchmarks.utils.version import SDK_SHORT_SHA
 from openhands.sdk import LLM, Agent, Conversation, get_logger
-from openhands.sdk.workspace import RemoteWorkspace
+from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
 from openhands.tools.preset.default import get_default_tools
-from openhands.workspace import APIRemoteWorkspace, DockerWorkspace
 
 
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = get_logger(__name__)
+
+
+def make_instance(inst_file: str) -> EvalInstance:
+    required_keys = (
+        "instance_id",
+        "image_name",
+        "problem_statement",
+        "repo_name",
+        "base_commit",
+        "remote_user",
+        "project_path",
+        "script_folder",
+        "remote_workspace_folder",
+        "FAIL_TO_PASS",
+    )
+
+    with open(inst_file, "r") as f:
+        curr_instance: dict = json.loads(f.read())
+        for key in required_keys:
+            if key not in curr_instance:
+                logger.warning(f"{key} is missing...")
+
+        instance = EvalInstance(
+            id=curr_instance["instance_id"],
+            data={
+                "repo": curr_instance["repo_name"],
+                "project_path": curr_instance["project_path"].rstrip(
+                    "/"
+                ),  # repo data store path
+                "problem_statement": curr_instance["problem_statement"],
+                "base_commit": curr_instance.get("base_commit", ""),
+                "image_name": curr_instance.get("image_name", ""),
+                "FAIL_TO_PASS": curr_instance.get("FAIL_TO_PASS", ""),
+                "remote_user": curr_instance.get("remote_user", ""),
+                "repo_path": f"/workspace/{curr_instance['repo_name'].split('/')[-1]}",  # Agent work place
+                "script_folder": curr_instance.get(
+                    "script_folder", ""
+                ),  # test script directory
+            },
+        )
+
+        if not os.path.exists(instance.data["repo_path"]):
+            os.makedirs(instance.data["repo_path"])
+
+    return instance
 
 
 def get_instruction(
@@ -78,17 +118,9 @@ class SWEBenchEvaluation(Evaluation):
     def prepare_instances(self) -> List[EvalInstance]:
         logger.info("Setting up SWE-bench evaluation data")
 
-        df = get_dataset(
-            dataset_name=self.metadata.dataset,
-            split=self.metadata.dataset_split,
-            eval_limit=self.metadata.eval_limit,
-            selected_instances_file=self.metadata.selected_instances_file,
-        )
-
-        instances: List[EvalInstance] = []
-        for _, row in df.iterrows():
-            inst_id = str(row["instance_id"])
-            instances.append(EvalInstance(id=inst_id, data=row.to_dict()))
+        instances: List[EvalInstance] = [
+            make_instance(self.metadata.selected_instances_file)
+        ]
 
         logger.info("Total instances to process: %d", len(instances))
         return instances
@@ -98,73 +130,8 @@ class SWEBenchEvaluation(Evaluation):
         """
         Use DockerWorkspace by default.
         """
-        official_docker_image = get_official_docker_image(instance.id)
-        build_target = "source-minimal"
-        custom_tag = extract_custom_tag(official_docker_image)
-        # For non-binary targets, append target suffix
-        suffix = f"-{build_target}" if build_target != "binary" else ""
-
         if self.metadata.workspace_type == "docker":
-            agent_server_image = (
-                f"{EVAL_AGENT_SERVER_IMAGE}:{SDK_SHORT_SHA}-{custom_tag}{suffix}"
-            )
-            SKIP_BUILD = os.getenv("SKIP_BUILD", "1").lower() in ("1", "true", "yes")
-            logger.info(f"SKIP_BUILD={SKIP_BUILD}")
-            if not SKIP_BUILD:
-                logger.info(
-                    f"Building workspace from {official_docker_image} "
-                    f"for instance {instance.id}. "
-                    "This may take a while...\n"
-                    "You can run benchmarks/swebench/build_images.py and set "
-                    "SWE_BENCH_SKIP_BUILD=1 to skip building and use pre-built "
-                    "agent-server image."
-                )
-                output = build_image(
-                    base_image=official_docker_image,
-                    target_image=EVAL_AGENT_SERVER_IMAGE,
-                    custom_tag=custom_tag,
-                    target=build_target,
-                    push=False,
-                )
-                logger.info(f"Image build output: {output}")
-                assert output.error is None, f"Image build failed: {output.error}"
-                if agent_server_image not in output.tags:
-                    raise RuntimeError(
-                        f"Built image tags {output.tags} do not include expected tag "
-                        f"{agent_server_image}"
-                    )
-
-            workspace = DockerWorkspace(
-                server_image=agent_server_image,
-                working_dir="/workspace",
-            )
-        elif self.metadata.workspace_type == "remote":
-            runtime_api_key = os.getenv("RUNTIME_API_KEY")
-            sdk_short_sha = os.getenv("SDK_SHORT_SHA", SDK_SHORT_SHA)
-            if not runtime_api_key:
-                raise ValueError(
-                    "RUNTIME_API_KEY environment variable is not set for remote workspace"
-                )
-
-            agent_server_image = (
-                f"{EVAL_AGENT_SERVER_IMAGE}:{sdk_short_sha}-{custom_tag}{suffix}"
-            )
-            if not image_exists(agent_server_image):
-                raise RuntimeError(
-                    f"Agent server image {agent_server_image} does not exist in container registry, "
-                    "make sure to build, push it, and make it public accessible before using remote workspace."
-                )
-            logger.info(
-                f"Using remote workspace with image {agent_server_image} (sdk sha: {sdk_short_sha})"
-            )
-            workspace = APIRemoteWorkspace(
-                runtime_api_url=os.getenv(
-                    "RUNTIME_API_URL", "https://runtime.eval.all-hands.dev"
-                ),
-                runtime_api_key=runtime_api_key,
-                server_image=agent_server_image,
-                target_type="source" if "source" in build_target else "binary",
-            )
+            workspace = LocalWorkspace(working_dir=instance.data["repo_path"])
         else:
             raise ValueError(
                 f"Unsupported workspace_type: {self.metadata.workspace_type}"
@@ -203,13 +170,8 @@ class SWEBenchEvaluation(Evaluation):
             # security_analyzer=LLMSecurityAnalyzer(),
         )
 
-        assert isinstance(workspace, RemoteWorkspace)
-
         def _log_event(ev):  # keep it simple
             logger.debug("Event: %s", ev)
-
-        repo_path = f"/workspace/{instance.data['repo'].split('/')[-1]}/"
-        instance.data["repo_path"] = repo_path
 
         conversation = Conversation(
             agent=agent,
@@ -218,13 +180,19 @@ class SWEBenchEvaluation(Evaluation):
             max_iteration_per_run=self.metadata.max_iterations,
         )
 
-        logger.info("repo_path: %s", repo_path)
-        cp_testebed_repo = workspace.execute_command(
-            (f"mkdir -p {repo_path} ; cp -r /testbed/. {repo_path}")
-        )
-        assert cp_testebed_repo.exit_code == 0, (
-            f"cp_testebed_repo failed: {cp_testebed_repo.stderr}"
-        )
+        repo_path = instance.data["repo_path"]
+        proj_path = instance.data["project_path"]
+        if proj_path != repo_path:
+            cp_repo = workspace.execute_command(
+                f"mkdir -p {repo_path} ; rm -rf {repo_path}/* ; cp -r {proj_path}/. {repo_path}"
+            )
+            assert cp_repo.exit_code == 0, f"cp_repo failed: {cp_repo.stderr}"
+        if not instance.data["base_commit"]:
+            hash_res = workspace.execute_command(
+                f"cd {proj_path} && git rev-parse HEAD"
+            )
+            assert hash_res.exit_code == 0
+            instance.data["base_commit"] = hash_res.stdout.strip()
 
         # git reset
         git_reset = workspace.execute_command(f"cd {repo_path} ; git reset --hard")

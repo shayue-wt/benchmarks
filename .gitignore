@@ -217,3 +217,5 @@ workspace/
 # Evaluation outputs
 eval_outputs/
 builds/
+.DS_Store
+.idea
