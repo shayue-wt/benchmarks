@@ -27,6 +27,9 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = get_logger(__name__)
+logger.setLevel(logging.DEBUG)
+for h in logger.handlers:
+    h.setLevel(logging.DEBUG)
 
 
 def make_instance(inst_file: str) -> EvalInstance:
