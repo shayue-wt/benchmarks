@@ -1,5 +1,4 @@
 # vim /openhands/python/lib/python3.12/site-packages/openhands/sdk/agent/agent.py # FIXME: 注释掉 277-280
-# vim /openhands/python/lib/python3.12/site-packages/openhands/sdk/conversation/impl/local_conversation.py
 
 import json
 import logging
