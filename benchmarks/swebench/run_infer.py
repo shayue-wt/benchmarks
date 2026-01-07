@@ -95,6 +95,7 @@ def make_instance(inst_file: str) -> EvalInstance:
 
     return instance
 
+
 @observe(name="agent.step", ignore_inputs=["state", "on_event"])
 def _hijack_step(
     self,
