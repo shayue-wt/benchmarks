@@ -1,6 +1,10 @@
+# vim /openhands/python/lib/python3.12/site-packages/openhands/sdk/agent/agent.py # FIXME: 注释掉 277-280
+# vim /openhands/python/lib/python3.12/site-packages/openhands/sdk/conversation/impl/local_conversation.py
+
 import json
 import logging
 import os
+import types
 from pathlib import Path
 from typing import List
 
@@ -21,6 +25,22 @@ from benchmarks.utils.models import (
 from openhands.sdk import LLM, Agent, Conversation, get_logger
 from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
 from openhands.tools.preset.default import get_default_tools
+
+from openhands.sdk.observability.laminar import observe
+from openhands.sdk.agent.utils import make_llm_completion, prepare_llm_messages
+from openhands.sdk.conversation import (
+    ConversationCallbackType,
+    ConversationState,
+    ConversationTokenCallbackType,
+    LocalConversation,
+)
+from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.event.condenser import Condensation, CondensationRequest
+from openhands.sdk.llm import Message, TextContent
+from openhands.sdk.llm.exceptions import (
+    FunctionCallValidationError,
+    LLMContextWindowExceedError,
+)
 
 
 logging.basicConfig(
@@ -76,6 +96,144 @@ def make_instance(inst_file: str) -> EvalInstance:
 
     return instance
 
+@observe(name="agent.step", ignore_inputs=["state", "on_event"])
+def _hijack_step(
+    self,
+    conversation: LocalConversation,
+    on_event: ConversationCallbackType,
+    on_token: ConversationTokenCallbackType | None = None,
+) -> None:
+    state = conversation.state
+    # Check for pending actions (implicit confirmation)
+    # and execute them before sampling new actions.
+    pending_actions = ConversationState.get_unmatched_actions(state.events)
+    if pending_actions:
+        logger.info(
+            "Confirmation mode: Executing %d pending action(s)",
+            len(pending_actions),
+        )
+        self._execute_actions(conversation, pending_actions, on_event)
+        return
+
+    # Prepare LLM messages using the utility function
+    _messages_or_condensation = prepare_llm_messages(
+        state.events, condenser=self.condenser
+    )
+
+    # Process condensation event before agent samples another action
+    if isinstance(_messages_or_condensation, Condensation):
+        on_event(_messages_or_condensation)
+        return
+
+    _messages = _messages_or_condensation
+
+    logger.debug(
+        "Sending messages to LLM: "
+        f"{json.dumps([m.model_dump() for m in _messages[1:]], indent=2)}"
+    )
+
+    try:
+        llm_response = make_llm_completion(
+            self.llm,
+            _messages,
+            tools=list(self.tools_map.values()),
+            on_token=on_token,
+        )
+    except FunctionCallValidationError as e:
+        logger.warning(f"LLM generated malformed function call: {e}")
+        error_message = MessageEvent(
+            source="user",
+            llm_message=Message(
+                role="user",
+                content=[TextContent(text=str(e))],
+            ),
+        )
+        on_event(error_message)
+        return
+    except LLMContextWindowExceedError as e:
+        # If condenser is available and handles requests, trigger condensation
+        if (
+            self.condenser is not None
+            and self.condenser.handles_condensation_requests()
+        ):
+            logger.warning(
+                "LLM raised context window exceeded error, triggering condensation"
+            )
+            on_event(CondensationRequest())
+            return
+        # No condenser available or doesn't handle requests; log helpful warning
+        self._log_context_window_exceeded_warning()
+        raise e
+
+    # LLMResponse already contains the converted message and metrics snapshot
+    message: Message = llm_response.message
+
+    has_reasoning = (
+        message.responses_reasoning_item is not None
+        or message.reasoning_content is not None
+        or (message.thinking_blocks and len(message.thinking_blocks) > 0)
+    )
+    has_content = any(
+        isinstance(c, TextContent) and c.text.strip() for c in message.content
+    )
+
+    if message.tool_calls and len(message.tool_calls) > 0:
+        if not all(isinstance(c, TextContent) for c in message.content):
+            logger.warning(
+                "LLM returned tool calls but message content is not all "
+                "TextContent - ignoring non-text content"
+            )
+
+        # Generate unique batch ID for this LLM response
+        thought_content = [c for c in message.content if isinstance(c, TextContent)]
+
+        action_events: list[ActionEvent] = []
+        for i, tool_call in enumerate(message.tool_calls):
+            action_event = self._get_action_event(
+                tool_call,
+                llm_response_id=llm_response.id,
+                on_event=on_event,
+                security_analyzer=state.security_analyzer,
+                thought=thought_content
+                if i == 0
+                else [],  # Only first gets thought
+                # Only first gets reasoning content
+                reasoning_content=message.reasoning_content if i == 0 else None,
+                # Only first gets thinking blocks
+                thinking_blocks=list(message.thinking_blocks) if i == 0 else [],
+                responses_reasoning_item=message.responses_reasoning_item
+                if i == 0
+                else None,
+            )
+            if action_event is None:
+                continue
+            action_events.append(action_event)
+
+        # Handle confirmation mode - exit early if actions need confirmation
+        if self._requires_user_confirmation(state, action_events):
+            return
+
+        if action_events:
+            self._execute_actions(conversation, action_events, on_event)
+
+        # Emit VLLM token ids if enabled before returning
+        self._maybe_emit_vllm_tokens(llm_response, on_event)
+        return
+
+    # No tool calls - emit message event for reasoning or content responses
+    if not has_reasoning and not has_content:
+        logger.warning("LLM produced empty response - continuing agent loop")
+
+    msg_event = MessageEvent(
+        source="agent",
+        llm_message=message,
+        llm_response_id=llm_response.id,
+    )
+    on_event(msg_event)
+
+    # Emit VLLM token ids if enabled
+    self._maybe_emit_vllm_tokens(llm_response, on_event)
+
 
 def get_instruction(
     instance: dict,
@@ -99,8 +257,8 @@ def get_instruction(
         "workspace_dir_name": workspace_dir_name,
         "actual_workspace_path": workspace_path,
         "metadata": metadata,
+        "test_instructions": ""
     }
-    context["test_instructions"] = ""
 
     # Render the instruction
     instruction = template.render(context)
@@ -172,6 +330,7 @@ class SWEBenchEvaluation(Evaluation):
             # ),
             # security_analyzer=LLMSecurityAnalyzer(),
         )
+        agent.step = types.MethodType(_hijack_step, agent)
 
         def _log_event(ev):  # keep it simple
             logger.debug("Event: %s", ev)
