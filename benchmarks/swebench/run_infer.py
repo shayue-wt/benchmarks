@@ -330,7 +330,8 @@ class SWEBenchEvaluation(Evaluation):
             # ),
             # security_analyzer=LLMSecurityAnalyzer(),
         )
-        agent.step = types.MethodType(_hijack_step, agent)
+        # 使用 object.__setattr__ 绕过 Pydantic 的 frozen 限制
+        object.__setattr__(agent, "step", types.MethodType(_hijack_step, agent))
 
         def _log_event(ev):  # keep it simple
             logger.debug("Event: %s", ev)
