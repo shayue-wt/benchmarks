@@ -22,10 +22,6 @@ from benchmarks.utils.models import (
     EvalOutput,
 )
 from openhands.sdk import LLM, Agent, Conversation, get_logger
-from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
-from openhands.tools.preset.default import get_default_tools
-
-from openhands.sdk.observability.laminar import observe
 from openhands.sdk.agent.utils import make_llm_completion, prepare_llm_messages
 from openhands.sdk.conversation import (
     ConversationCallbackType,
@@ -40,6 +36,9 @@ from openhands.sdk.llm.exceptions import (
     FunctionCallValidationError,
     LLMContextWindowExceedError,
 )
+from openhands.sdk.observability.laminar import observe
+from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
+from openhands.tools.preset.default import get_default_tools
 
 
 logging.basicConfig(
@@ -194,9 +193,7 @@ def _hijack_step(
                 llm_response_id=llm_response.id,
                 on_event=on_event,
                 security_analyzer=state.security_analyzer,
-                thought=thought_content
-                if i == 0
-                else [],  # Only first gets thought
+                thought=thought_content if i == 0 else [],  # Only first gets thought
                 # Only first gets reasoning content
                 reasoning_content=message.reasoning_content if i == 0 else None,
                 # Only first gets thinking blocks
@@ -257,7 +254,7 @@ def get_instruction(
         "workspace_dir_name": workspace_dir_name,
         "actual_workspace_path": workspace_path,
         "metadata": metadata,
-        "test_instructions": ""
+        "test_instructions": "",
     }
 
     # Render the instruction
@@ -340,6 +337,7 @@ class SWEBenchEvaluation(Evaluation):
             agent=agent,
             workspace=workspace,
             callbacks=[_log_event],
+            stuck_detection=False,
             max_iteration_per_run=self.metadata.max_iterations,
         )
 
